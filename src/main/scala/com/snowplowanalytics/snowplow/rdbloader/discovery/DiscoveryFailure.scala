@@ -13,7 +13,6 @@
 package com.snowplowanalytics.snowplow.rdbloader.discovery
 
 import cats.data.NonEmptyList
-import cats.syntax.show._
 
 import com.snowplowanalytics.snowplow.rdbloader.{S3, LoaderError}
 

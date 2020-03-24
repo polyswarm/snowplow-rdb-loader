@@ -10,22 +10,22 @@
  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the Apache License Version 2.0 for the specific language governing permissions and limitations there under.
  */
-package com.snowplowanalytics.snowplow.rdbloader
-package loaders
+package com.snowplowanalytics.snowplow.rdbloader.loaders
 
-import java.sql.{ Timestamp => SqlTimestamp }
+import java.sql.{Timestamp => SqlTimestamp}
 
+import cats.Monad
 import cats.implicits._
-
+import com.snowplowanalytics.snowplow.rdbloader.dsl.{Cache, Control, FileSystem, S3I, SQL, SSH}
 import shapeless.tag
 import shapeless.tag._
 
 // This project
-import common.StorageTarget
-
-import config.{ CliConfig, Step }
-import db.Entities._
-import discovery.DataDiscovery
+import com.snowplowanalytics.snowplow.rdbloader._
+import com.snowplowanalytics.snowplow.rdbloader.config.{ CliConfig, Step }
+import com.snowplowanalytics.snowplow.rdbloader.common.StorageTarget
+import com.snowplowanalytics.snowplow.rdbloader.db.Entities._
+import com.snowplowanalytics.snowplow.rdbloader.discovery.DataDiscovery
 
 
 object Common {
@@ -82,15 +82,15 @@ object Common {
    *
    * @param cliConfig RDB Loader app configuration
    */
-  def load(cliConfig: CliConfig, discovery: List[DataDiscovery]): LoaderAction[Unit] = {
+  def load[F[_]: Monad: Control: FileSystem: S3I: SSH: SQL](env: Environment[F], cliConfig: CliConfig, discovery: List[DataDiscovery]): LoaderAction[F, Unit] = {
     val loadDb = cliConfig.target match {
       case postgresqlTarget: StorageTarget.PostgresqlConfig =>
-        PostgresqlLoader.run(postgresqlTarget, cliConfig.steps, discovery)
+        PostgresqlLoader.run[F](env, postgresqlTarget, cliConfig.steps, discovery)
       case redshiftTarget: StorageTarget.RedshiftConfig =>
-        RedshiftLoader.run(cliConfig.configYaml, redshiftTarget, cliConfig.steps, discovery)
+        RedshiftLoader.run[F](env, cliConfig.configYaml, redshiftTarget, cliConfig.steps, discovery)
     }
 
-    Security.bracket(cliConfig.target.sshTunnel, loadDb)
+    SSH.bracket[F](env, cliConfig.target.sshTunnel, loadDb)
   }
 
   /**
@@ -98,7 +98,7 @@ object Common {
     *
     * @param cliConfig RDB Loader app configuration
     */
-  def discover(cliConfig: CliConfig): LoaderAction[List[DataDiscovery]] = {
+  def discover[F[_]: Monad: Cache: Control: S3I](env: Environment[F], cliConfig: CliConfig): LoaderAction[F, List[DataDiscovery]] = {
     // Shortcuts
     val shredJob = cliConfig.configYaml.storage.versions.rdbShredder
     val region = cliConfig.configYaml.aws.s3.region
@@ -113,13 +113,13 @@ object Common {
 
     cliConfig.target match {
       case _: StorageTarget.RedshiftConfig =>
-        val original = DataDiscovery.discoverFull(target, cliConfig.target.id, shredJob, region, assets)
+        val original = DataDiscovery.discoverFull[F](env, target, cliConfig.target.id, shredJob, region, assets)
         if (cliConfig.steps.contains(Step.ConsistencyCheck) && cliConfig.target.processingManifest.isEmpty)
-          DataDiscovery.checkConsistency(original)
+          DataDiscovery.checkConsistency[F](original)
         else original
       case _: StorageTarget.PostgresqlConfig =>
         // Safe to skip consistency check as whole folder will be downloaded
-        DataDiscovery.discoverFull(target, cliConfig.target.id, shredJob, region, assets)
+        DataDiscovery.discoverFull[F](env, target, cliConfig.target.id, shredJob, region, assets)
     }
   }
 
@@ -128,22 +128,22 @@ object Common {
     * @param loadAction set of queries inside a transaction loading atomic and shredded only
     *                   (no vacuum or analyze)
     */
-  def retryIfFailed(loadAction: LoaderAction[Unit]): LoaderAction[Unit] = {
+  def retryIfFailed[F[_]: Monad: Control: SQL](env: Environment[F], loadAction: LoaderAction[F, Unit]): LoaderAction[F, Unit] = {
     val retry = loadAction.value.flatMap[Either[LoaderError, Unit]] {
       case Left(LoaderError.StorageTargetError(message)) if message.contains("Connection refused") =>
         for {
-          _          <- LoaderA.print(s"Loading failed with [$message], making another attempt")
-          retransact <- (LoaderA.executeUpdate(Common.AbortTransaction) *> LoaderA.executeUpdate(Common.BeginTransaction)).value
-          _          <- LoaderA.sleep(60000)
+          _          <- Control[F].print(s"Loading failed with [$message], making another attempt")
+          retransact <- (SQL[F].executeUpdate(env, Common.AbortTransaction) *> SQL[F].executeUpdate(env, Common.BeginTransaction)).value
+          _          <- Control[F].sleep(60000)
           result     <- retransact match {
             case Right(_) => loadAction.value
-            case Left(_)  => Action.lift(retransact.void)
+            case Left(_)  => Monad[F].pure(retransact.void)
           }
         } yield result
       case e @ Left(_) =>
-        LoaderA.print("Loading failed, no retries will be made") *> Action.lift(e)
+        Control[F].print("Loading failed, no retries will be made") *> Monad[F].pure(e)
       case success =>
-        Action.lift(success)
+        Monad[F].pure(success)
     }
     LoaderAction(retry)
   }
@@ -168,33 +168,33 @@ object Common {
     * @return true if manifest record exists and atomic data is empty, assuming folder contains no events
     *         and next manifest record shouldn't be written
     */
-  def checkLoadManifest(schema: String, eventsTable: EventsTable, possiblyEmpty: Boolean): LoaderAction[Boolean] = {
+  def checkLoadManifest[F[_]: Monad: Control: SQL](env: Environment[F], schema: String, eventsTable: EventsTable, possiblyEmpty: Boolean): LoaderAction[F, Boolean] = {
     for {
-      latestAtomicTstamp <- getEtlTstamp(eventsTable)
+      latestAtomicTstamp <- getEtlTstamp(env, eventsTable)
       isEmptyLoad <- latestAtomicTstamp match {
         case Some(timestamp) => for {
-          _ <- LoaderA.print(s"Load manifest: latest timestamp in ${eventsTable.getDescriptor} is ${timestamp.etlTstamp}").liftA
-          item <- getManifestItem(schema, timestamp.etlTstamp)
+          _ <- Control[F].print(s"Load manifest: latest timestamp in ${eventsTable.getDescriptor} is ${timestamp.etlTstamp}").liftA
+          item <- getManifestItem(env, schema, timestamp.etlTstamp)
           empty <- item match {
             case Some(manifest) if manifest.etlTstamp == timestamp.etlTstamp && possiblyEmpty =>
               val message = s"Load manifest: record for ${manifest.etlTstamp} already exists, but atomic folder is empty"
-              for { _ <- LoaderA.print(message).liftA } yield true
+              for { _ <- Control[F].print(message).liftA } yield true
             case Some(manifest) if manifest.etlTstamp == timestamp.etlTstamp =>
               val message = getLoadManifestMessage(manifest)
-              LoaderAction.liftE[Boolean](LoaderError.LoadManifestError(message).asLeft)
+              LoaderAction.liftE[F, Boolean](LoaderError.LoadManifestError(message).asLeft)
             case Some(record) =>
-              for { _ <- LoaderA.print(s"Load manifest: latest record ${record.show}").liftA } yield false
+              for { _ <- Control[F].print(s"Load manifest: latest record ${record.show}").liftA } yield false
             case None =>
-              for { _ <- LoaderA.print(s"Load manifest: no records found").liftA } yield false
+              for { _ <- Control[F].print(s"Load manifest: no records found").liftA } yield false
           }
         } yield empty
-        case None => LoaderAction.lift(false)
+        case None => LoaderAction.lift[F, Boolean](false)
       }
     } yield isEmptyLoad
   }
 
   /** Get ETL timestamp of ongoing load */
-  private[loaders] def getEtlTstamp(eventsTable: EventsTable): LoaderAction[Option[Timestamp]] = {
+  private[loaders] def getEtlTstamp[F[_]: SQL](env: Environment[F], eventsTable: EventsTable): LoaderAction[F, Option[Timestamp]] = {
     val query =
       s"""SELECT etl_tstamp
          | FROM ${eventsTable.getDescriptor}
@@ -202,11 +202,11 @@ object Common {
          | ORDER BY etl_tstamp DESC
          | LIMIT 1""".stripMargin
 
-    LoaderA.executeQuery[Option[Timestamp]](SqlString.unsafeCoerce(query))
+    SQL[F].executeQuery[Option[Timestamp]](env, SqlString.unsafeCoerce(query))
   }
 
   /** Get latest load manifest item */
-  private[loaders] def getManifestItem(schema: String, etlTstamp: SqlTimestamp): LoaderAction[Option[LoadManifestItem]] = {
+  private[loaders] def getManifestItem[F[_]: SQL](env: Environment[F], schema: String, etlTstamp: SqlTimestamp): LoaderAction[F, Option[LoadManifestItem]] = {
     val query =
       s"""SELECT *
          | FROM ${getManifestTable(schema)}
@@ -214,7 +214,7 @@ object Common {
          | ORDER BY etl_tstamp DESC
          | LIMIT 1""".stripMargin
 
-    LoaderA.executeQuery[Option[LoadManifestItem]](SqlString.unsafeCoerce(query))
+    SQL[F].executeQuery[Option[LoadManifestItem]](env, SqlString.unsafeCoerce(query))
   }
 
   private def getLoadManifestMessage(manifest: LoadManifestItem): String =

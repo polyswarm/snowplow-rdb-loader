@@ -10,8 +10,7 @@
  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the Apache License Version 2.0 for the specific language governing permissions and limitations there under.
  */
-package com.snowplowanalytics.snowplow.rdbloader
-package utils
+package com.snowplowanalytics.snowplow.rdbloader.utils
 
 import cats.data._
 import cats.implicits._
@@ -21,9 +20,8 @@ import io.circe._
 import com.snowplowanalytics.iglu.client.resolver.registries.Registry
 
 // This project
-import LoaderError._
-import discovery.DiscoveryFailure
-import config.CliConfig
+import com.snowplowanalytics.snowplow.rdbloader.{ LoaderError, Log }
+import com.snowplowanalytics.snowplow.rdbloader.config.CliConfig
 
 /**
  * Various common utility functions

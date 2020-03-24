@@ -12,11 +12,12 @@
  */
 package com.snowplowanalytics.snowplow.rdbloader
 
-import cats.syntax.flatMap._
+import cats.Monad
 import cats.data.Validated._
+import cats.implicits._
+import com.snowplowanalytics.snowplow.rdbloader.dsl.{Cache, Control, FileSystem, Iglu, S3I, SQL, SSH}
 
 // This project
-import interpreters.Interpreter
 import config.CliConfig
 import loaders.Common.{ load, discover }
 
@@ -50,33 +51,39 @@ object Main {
    * @return exit code status. 0 for success, 1 if anything went wrong
    */
   def run(config: CliConfig): Int = {
-    val interpreter = Interpreter.initialize(config)
+    import cats.Id
 
-    val actions: Action[Int] = for {
-      data       <- discover(config).flatTap(db.Migration.perform(config.target.schema)).value
-      result     <- data match {
-        case Right(discovery) => load(config, discovery).value
-        case Left(LoaderError.StorageTargetError(message)) =>
-          val upadtedMessage = s"$message\n${interpreter.getLastCopyStatements}"
-          ActionE.liftError(LoaderError.StorageTargetError(upadtedMessage))
-        case Left(error) => ActionE.liftError(error)
-      }
-      message     = utils.Common.interpret(config, result)
-      _          <- LoaderA.track(message)
-      status     <- close(config.logKey, message)
-    } yield status
+    implicit val idCache: Cache[Id] = Cache.cacheInterpreter
+    implicit val idControl: Control[Id] = Control.controlInterpreter
+    implicit val idIglu: Iglu[Id] = Iglu.igluInterpreter
+    implicit val idJdbc: SQL[Id] = if (config.dryRun) SQL.jdbcDryRunInterpreter else SQL.jdbcInterpreter
+    implicit val idS3: S3I[Id] = S3I.s3Interpreter
+    implicit val idSsh: SSH[Id] = SSH.sshInterpreter
+    implicit val idFileSystem: FileSystem[Id] = FileSystem.fileSystemInterpreter
 
-    actions.foldMap(interpreter.run)
+    val env: Environment[Id] = Environment.initialize[Id](config).right.get
+
+    val data = discover[Id](env, config).flatTap(db.Migration.perform[Id](env, config.target.schema)).value
+    val result = data match {
+      case Right(discovery) => load[Id](env, config, discovery).value
+      case Left(LoaderError.StorageTargetError(message)) =>
+        val upadtedMessage = s"$message\n${env.getLastCopyStatements}"
+        LoaderError.StorageTargetError(upadtedMessage).asLeft
+      case Left(error) => error.asLeft
+    }
+    val message = utils.Common.interpret(config, result)
+    Control.controlInterpreter.track(env, message)
+    close[Id](env, config.logKey, message)
   }
 
   /** Get exit status based on all previous steps */
-  private def close(logKey: Option[S3.Key], message: Log) = {
+  private def close[F[_]: Monad: Control: S3I](env: Environment[F], logKey: Option[S3.Key], message: Log) = {
     logKey match {
       case Some(key) => for {
-        dumpResult <- LoaderA.dump(key)
-        status     <- LoaderA.exit(message, Some(dumpResult))
+        dumpResult <- Control[F].dump(env, key)
+        status     <- Control[F].exit(message, Some(dumpResult))
       } yield status
-      case None => LoaderA.exit(message, None)
+      case None => Control[F].exit(message, None)
     }
   }
 }

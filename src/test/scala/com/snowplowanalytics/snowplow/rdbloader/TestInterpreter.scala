@@ -24,7 +24,7 @@ import com.snowplowanalytics.iglu.schemaddl.jsonschema.circe.implicits._
 import com.snowplowanalytics.iglu.schemaddl.migrations.{ SchemaList => DSchemaList }
 
 import com.snowplowanalytics.snowplow.rdbloader.db.Decoder
-import com.snowplowanalytics.snowplow.rdbloader.Security.Tunnel
+import .Tunnel
 import com.snowplowanalytics.snowplow.rdbloader.db.Entities.{Columns, TableState}
 
 
